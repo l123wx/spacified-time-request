@@ -1,5 +1,5 @@
 {
-  "name": "@l123wx/specified-time-request",
+  "name": "specified-time-request",
   "type": "module",
   "version": "0.0.2",
   "packageManager": "pnpm@10.20.0",
