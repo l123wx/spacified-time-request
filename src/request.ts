@@ -7,7 +7,10 @@ import { HTTPParser } from 'http-parser-js'
 
 type Time = string | number | Date
 
-interface RequestOptions {
+const NO_CANCEL: () => void = () => {}
+const HTTP_HEADER_END = '\r\n\r\n'
+
+export interface RequestOptions {
   host: string
   port: number
   method?: string
@@ -25,7 +28,18 @@ interface HttpResponse {
   body: string
 }
 
-async function request(_options: RequestOptions): Promise<HttpResponse> {
+export class CancellationError extends Error {
+  constructor(message = 'Request cancelled') {
+    super(message)
+    this.name = 'CancellationError'
+  }
+}
+
+interface CancelableRequest extends Promise<HttpResponse> {
+  cancel: (reason?: string) => void
+}
+
+function request(_options: RequestOptions): CancelableRequest {
   const defaultOptions = {
     path: '/',
     method: 'GET',
@@ -37,6 +51,7 @@ async function request(_options: RequestOptions): Promise<HttpResponse> {
   const options = {
     ...defaultOptions,
     ..._options,
+    path: _options.path || '/',
   }
 
   const {
@@ -50,11 +65,17 @@ async function request(_options: RequestOptions): Promise<HttpResponse> {
     https,
   } = options
 
-  const socket = await connect(port, host, https)
+  // 参数验证
+  if (!host) {
+    throw new Error('host is required')
+  }
+  if (typeof port !== 'number' || port < 0 || port > 65535) {
+    throw new Error(`Invalid port: ${port}`)
+  }
 
   const requestHeaders: Record<string, string> = {
     Host: host,
-    Connection: 'keep-alive',
+    Connection: 'close',
     accept: 'application/json',
     ...headers,
   }
@@ -65,57 +86,192 @@ async function request(_options: RequestOptions): Promise<HttpResponse> {
     requestHeaders['Content-Length'] = Buffer.byteLength(body).toString()
   }
 
-  return new Promise((resolve, reject) => {
-    let responseData = Buffer.alloc(0)
+  // 收集所有可取消的资源
+  const cancelFns: (() => void)[] = []
+  let cancelled = false
 
-    // 监听响应
-    socket.on('data', (chunk: Buffer) => {
-      responseData = Buffer.concat([responseData, chunk])
-      resolve(parseResponse(responseData))
-      // 暂时不考虑tcp 复用，所以请求完就关闭
-      socket.end()
-    })
+  const promise = connect(port, host, https).then((socket) => {
+    if (cancelled) {
+      socket.destroy()
+      throw new CancellationError('Request cancelled before connection established')
+    }
 
-    socket.on('error', reject)
+    // 注册 socket 销毁为取消动作
+    cancelFns.push(() => socket.destroy())
 
-    sendHeader(socket, { headers: requestHeaders, method, path }, isHasBodyRequest ? undefined : targetTime)
-      .then(() => {
-        // 如果有请求体，分块发送
-        if (isHasBodyRequest) {
-          // sendBodyInChunks(body, chunkSize, chunkDelay)
-          sendBody(socket, body, targetTime)
+    return new Promise<HttpResponse>((resolve, reject) => {
+      const parser = new HTTPParser(HTTPParser.RESPONSE)
+      const bodyChunks: Buffer[] = []
+      let messageComplete = false
+
+      const result: HttpResponse = {
+        statusCode: 0,
+        statusText: '',
+        headers: {},
+        body: '',
+      }
+
+      parser[HTTPParser.kOnHeadersComplete] = (info: { statusCode: number, statusMessage: string, headers: string[] }) => {
+        result.statusCode = info.statusCode
+        result.statusText = info.statusMessage || ''
+        for (let i = 0; i < info.headers.length; i += 2) {
+          const key = info.headers[i].toLowerCase()
+          const value = info.headers[i + 1]
+          result.headers[key] = value
         }
-      })
-  })
+      }
+
+      parser[HTTPParser.kOnBody] = (chunk: Buffer, offset: number, length: number) => {
+        bodyChunks.push(chunk.subarray(offset, offset + length))
+      }
+
+      parser[HTTPParser.kOnMessageComplete] = () => {
+        messageComplete = true
+        result.body = bodyChunks.length > 0
+          ? Buffer.concat(bodyChunks).toString()
+          : ''
+      }
+
+      function cleanup(): void {
+        socket.removeListener('data', onData)
+        socket.removeListener('error', onError)
+        socket.removeListener('close', onClose)
+      }
+
+      function onData(chunk: Buffer): void {
+        if (cancelled)
+          return
+        try {
+          parser.execute(chunk)
+        }
+        catch (err) {
+          cleanup()
+          socket.end()
+          reject(new Error(`HTTP parser error: ${err}`))
+          return
+        }
+        if (messageComplete) {
+          cleanup()
+          socket.end()
+          resolve(result)
+        }
+      }
+
+      function onError(err: Error): void {
+        cleanup()
+        if (cancelled) {
+          reject(new CancellationError())
+        }
+        else {
+          reject(err)
+        }
+      }
+
+      function onClose(): void {
+        cleanup()
+        if (cancelled) {
+          reject(new CancellationError())
+          return
+        }
+        if (result.statusCode > 0) {
+          if (!messageComplete) {
+            result.body = bodyChunks.length > 0
+              ? Buffer.concat(bodyChunks).toString()
+              : ''
+          }
+          resolve(result)
+        }
+        else {
+          reject(new Error('Connection closed with incomplete response'))
+        }
+      }
+
+      socket.on('data', onData)
+      socket.on('error', onError)
+      socket.on('close', onClose)
+
+      // 发送请求
+      sendHeader(socket, { headers: requestHeaders, method, path }, isHasBodyRequest ? undefined : targetTime)
+        .then(({ cancel: cancelHeader }) => {
+          cancelFns.push(cancelHeader)
+          if (cancelled)
+            return
+          if (isHasBodyRequest) {
+            return sendBody(socket, body!, targetTime).then(({ cancel: cancelBody }) => {
+              cancelFns.push(cancelBody)
+            })
+          }
+        })
+        .catch(reject)
+    })
+  }) as CancelableRequest
+
+  promise.cancel = () => {
+    if (cancelled)
+      return
+    cancelled = true
+    for (const fn of cancelFns) {
+      try {
+        fn()
+      }
+      catch (err) {
+        console.error('Error during cancellation:', err)
+      }
+    }
+    cancelFns.length = 0
+  }
+
+  return promise
 }
 
 function connect(port: number, host: string, https = false): Promise<Socket | TLSSocket> {
   return new Promise<Socket | TLSSocket>((resolve, reject) => {
+    let socket: Socket | TLSSocket
+    let resolved = false
+
+    function onConnect(): void {
+      if (resolved)
+        return
+      resolved = true
+      socket.off('error', onError)
+      socket.off('timeout', onTimeout)
+      resolve(socket)
+    }
+
+    function onError(err: Error): void {
+      if (resolved)
+        return
+      resolved = true
+      socket.off('connect', onConnect)
+      socket.off('timeout', onTimeout)
+      reject(err)
+    }
+
+    function onTimeout(): void {
+      socket.destroy()
+      if (resolved)
+        return
+      resolved = true
+      socket.off('connect', onConnect)
+      socket.off('error', onError)
+      reject(new Error('Connection timeout'))
+    }
+
     if (https) {
-      // HTTPS连接 - 使用TLS
-      const socket = tls.connect({
+      socket = tls.connect({
         host,
         port,
-        servername: host, // SNI支持
-        rejectUnauthorized: false, // 允许自签名证书（生产环境应设为true）
-      }, () => {
-        console.warn(`已通过TLS连接到 ${host}:${port}`, new Date().toISOString())
-        resolve(socket)
-      })
-
-      socket.on('error', reject)
-      socket.setTimeout(30000) // 30秒超时
+        servername: host,
+        rejectUnauthorized: false,
+      }, onConnect)
     }
     else {
-      // HTTP连接 - 使用普通TCP
-      const socket = net.createConnection(port, host, () => {
-        console.warn(`已连接到 ${host}:${port}`, new Date().toISOString())
-        resolve(socket)
-      })
-
-      socket.on('error', reject)
-      socket.setTimeout(30000) // 30秒超时
+      socket = net.createConnection(port, host, onConnect)
     }
+
+    socket.once('error', onError)
+    socket.once('timeout', onTimeout)
+    socket.setTimeout(30000)
   })
 }
 
@@ -123,11 +279,7 @@ async function sendHeader(
   socket: Socket,
   requestOptions: Pick<RequestOptions, 'headers' | 'method' | 'path'>,
   targetTime?: Time,
-): Promise<void> {
-  if (!socket) {
-    return Promise.reject(new Error('Socket not connected'))
-  }
-
+): Promise<{ cancel: () => void }> {
   const {
     headers = {},
     method,
@@ -140,134 +292,79 @@ async function sendHeader(
 
   const requestLine = `${method} ${path} HTTP/1.1\r\n`
   const requestHead = `${requestLine + headerLines}`
-  const emptyRow = '\r\n\r\n' // 当没有 Content-Length 时，传输空行即告诉服务端内容已经传输完毕
 
   socket.write(requestHead)
-  console.warn('已发送基本请求头数据', new Date().toISOString())
 
   if (targetTime) {
-    doOnTargetTime(() => {
-      socket.write(emptyRow)
-      console.warn('已发送头末尾数据', new Date().toISOString())
+    const cancel = doOnTargetTime(() => {
+      socket.write(HTTP_HEADER_END)
     }, targetTime)
+    return { cancel }
   }
-  else {
-    socket.write(emptyRow)
-  }
+
+  socket.write(HTTP_HEADER_END)
+  return { cancel: NO_CANCEL }
 }
 
-// 发送请求体
-async function sendBody(socket: Socket, body: string, targetTime?: Time): Promise<void> {
-  if (!socket) {
-    throw new Error('Socket not connected')
-  }
-
+function sendBody(socket: Socket, body: string, targetTime?: Time): Promise<{ cancel: () => void }> {
   const buffer = Buffer.from(body)
+  const baseChunk = buffer.subarray(0, -1)
+  const endChunk = buffer.subarray(-1)
 
-  const baseChunk = Uint8Array.prototype.slice.call(buffer, 0, buffer.length - 1)
-  const endChunk = Uint8Array.prototype.slice.call(buffer, buffer.length - 1, buffer.length)
-
-  console.warn('已发送基础 body 数据', new Date().toISOString())
   socket.write(baseChunk)
 
   if (targetTime) {
-    doOnTargetTime(() => {
+    const cancel = doOnTargetTime(() => {
       socket.write(endChunk)
-      console.warn('已发送末尾 body 数据', new Date().toUTCString())
     }, targetTime)
+    return Promise.resolve({ cancel })
+  }
+
+  socket.write(endChunk)
+  return Promise.resolve({ cancel: NO_CANCEL })
+}
+
+export function doOnTargetTime(callback: () => any, targetTime: Time): () => void {
+  const targetMs = new Date(targetTime).getTime()
+  const now = Date.now()
+
+  // 如果目标时间已过，立即执行
+  if (now >= targetMs) {
+    callback()
+    return NO_CANCEL
+  }
+
+  const delay = targetMs - now
+  const earlyWake = Math.max(0, delay - 20)
+
+  let timeoutId: NodeJS.Timeout | null = null
+  let executed = false
+
+  function execute(): void {
+    if (executed)
+      return
+    executed = true
+    while (Date.now() < targetMs) {
+      // Busy wait until target time
+    }
+    callback()
+  }
+
+  if (earlyWake > 0) {
+    timeoutId = setTimeout(execute, earlyWake)
   }
   else {
-    socket.write(endChunk)
-  }
-}
-
-// 解析HTTP响应（使用http-parser-js库）
-function parseResponse(rawResponse: Buffer): HttpResponse {
-  const parser = new HTTPParser(HTTPParser.RESPONSE)
-
-  const response: {
-    statusCode: number
-    statusText: string
-    headers: Record<string, string>
-    bodyChunks: Buffer[]
-    body?: string
-  } = {
-    statusCode: 0,
-    statusText: '',
-    headers: {},
-    bodyChunks: [],
+    execute()
   }
 
-  // 设置解析器回调
-  parser[HTTPParser.kOnHeadersComplete] = (info: any) => {
-    response.statusCode = info.statusCode
-    response.statusText = info.statusMessage || ''
-
-    // 解析头部
-    for (let i = 0; i < info.headers.length; i += 2) {
-      const key = info.headers[i].toLowerCase()
-      const value = info.headers[i + 1]
-      response.headers[key] = value
+  // 返回取消函数
+  return () => {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId)
+      timeoutId = null
     }
+    executed = true
   }
-
-  parser[HTTPParser.kOnBody] = (chunk: Buffer, offset: number, length: number) => {
-    response.bodyChunks.push(chunk.subarray(offset, offset + length))
-  }
-
-  parser[HTTPParser.kOnMessageComplete] = () => {
-    // 所有body chunk已接收
-    if (response.bodyChunks.length > 0) {
-      response.body = Buffer.concat(response.bodyChunks).toString()
-    }
-    else {
-      response.body = ''
-    }
-  }
-
-  try {
-    // 执行解析
-    const parseResult = parser.execute(rawResponse)
-    parser.finish()
-
-    // 检查解析结果
-    if (parseResult instanceof Error) {
-      throw parseResult
-    }
-
-    const bytesParsed = parseResult as number
-
-    // 检查是否解析成功
-    if (bytesParsed < rawResponse.length) {
-      console.warn(`警告：只解析了 ${bytesParsed} 字节中的 ${rawResponse.length} 字节`)
-    }
-
-    if (response.statusCode === 0) {
-      throw new Error('无法解析HTTP响应状态码')
-    }
-  }
-  catch (error) {
-    // 如果解析失败，回退到简单解析
-    console.warn('http-parser-js解析失败:', error)
-  }
-
-  return {
-    statusCode: response.statusCode,
-    statusText: response.statusText,
-    headers: response.headers,
-    body: response.body || '',
-  }
-}
-
-export function doOnTargetTime(callback: () => any, targetTime: Time): void {
-  const targetTimeNumber = new Date(targetTime).getTime()
-
-  const timeout: NodeJS.Timeout = setInterval(() => {
-    if (Date.now() >= targetTimeNumber) {
-      callback()
-      clearInterval(timeout)
-    }
-  }, 1)
 }
 
 export default request
