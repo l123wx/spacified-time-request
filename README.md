@@ -115,10 +115,163 @@ catch (error) {
 }
 ```
 
+### `Connection` 类
+
+底层连接控制器，将连接建立、请求准备和触发发送分离，支持更精细的控制场景。
+
+> `request()` 内部就是使用 `Connection` 实现的。
+
+#### 生命周期
+
+```
+Connection.connect() → prepare() → fire()
+                                 → destroy()
+```
+
+#### 静态方法
+
+##### `Connection.connect(host, port, https?)`
+
+建立 TCP/TLS 连接，返回 `Connection` 实例。
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `host` | `string` | ✅ | - | 目标主机名 |
+| `port` | `number` | ✅ | - | 目标端口号 |
+| `https` | `boolean` | ❌ | `false` | 是否使用 HTTPS |
+
+#### 实例方法
+
+##### `prepare(options)`
+
+发送请求头和请求体（不含最后触发数据），使服务器处于等待状态。
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `method` | `string` | ❌ | `'GET'` | HTTP 方法 |
+| `path` | `string` | ❌ | `'/'` | 请求路径 |
+| `headers` | `Record<string, string>` | ❌ | `{}` | 请求头 |
+| `body` | `string` | ❌ | `''` | 请求体 |
+
+##### `fire()`
+
+发送触发数据完成请求，设置响应解析器，返回响应。
+
+返回 `CancelableRequest<HttpResponse>`。
+
+##### `destroy()`
+
+主动销毁连接。
+
+#### 属性
+
+| 属性 | 类型 | 说明 |
+|------|------|------|
+| `isAlive` | `boolean` | 连接是否存活 |
+| `createdAt` | `number` | 连接建立时间戳（毫秒） |
+| `preparedAt` | `number \| null` | `prepare()` 调用时间戳（毫秒），未调用时为 `null` |
+
+#### 示例
+
+```ts
+import { Connection } from '@l123wx/specified-time-request'
+
+// 基本请求
+const conn = await Connection.connect('example.com', 443, true)
+conn.prepare({
+  method: 'POST',
+  path: '/api/checkout',
+  headers: {
+    'Host': 'example.com',
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer token',
+  },
+  body: JSON.stringify({ item: 'test' }),
+})
+const response = await conn.fire()
+
+// 预连接池：提前建连，失败时快速重试
+const pool = await Promise.all([
+  Connection.connect('example.com', 443, true),
+  Connection.connect('example.com', 443, true),
+  Connection.connect('example.com', 443, true),
+])
+
+for (const conn of pool) {
+  conn.prepare({ /* ... */ })
+}
+
+// 尝试第一个连接
+try {
+  const res = await pool[0].fire()
+}
+catch {
+  // 失败立即用第二个连接重试
+  const res = await pool[1].fire()
+}
+```
+
+### `testTimeout(conn)`
+
+等待服务器断开连接，返回连接保持时间。用于测试特定接口的空闲连接超时时间。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `conn` | `Connection` | ✅ | 已建立（并可选调用过 `prepare()`）的连接 |
+
+返回 `Promise<TimeoutResult>`：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `connectedMs` | `number` | 从连接建立到关闭的总时间 |
+| `preparedMs` | `number \| undefined` | 从 `prepare()` 到关闭的时间（调用 `prepare()` 后才有值） |
+
+### `testConnectionTimeout(options)`
+
+便捷函数：测试指定接口的服务器空闲连接超时时间。内部使用 `Connection` 实现，参数与 `request()` 相同（忽略 `targetTime`）。
+
+#### 示例
+
+```ts
+import { testConnectionTimeout } from '@l123wx/specified-time-request'
+
+const result = await testConnectionTimeout({
+  host: 'api.example.com',
+  port: 443,
+  https: true,
+  method: 'POST',
+  path: '/api/checkout',
+  body: JSON.stringify({ item: 'test' }),
+  headers: { Authorization: 'Bearer token' },
+})
+
+console.log(`连接保持 ${result.connectedMs}ms`)
+console.log(`请求等待 ${result.preparedMs}ms`)
+// 根据结果决定提前多久建连，确保不超过 preparedMs
+```
+
+### `doOnTargetTime(callback, targetTime)`
+
+在精确的目标时间执行回调。使用 `setTimeout` 提前唤醒 + 忙等待实现毫秒级精度。
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `callback` | `() => any` | 目标时间到达时执行的回调 |
+| `targetTime` | `Time` | 目标执行时间 |
+
+返回取消函数 `() => void`，调用后回调不再执行。
+
 ### 导出类型
 
 ```typescript
-import type { CancellationError, RequestOptions } from '@l123wx/specified-time-request'
+import type {
+  CancellationError,
+  Connection,
+  ConnectOptions,
+  RequestInit,
+  RequestOptions,
+  TimeoutResult,
+} from '@l123wx/specified-time-request'
 ```
 
 ### 时间精度
