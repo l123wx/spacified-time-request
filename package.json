@@ -1,7 +1,7 @@
 {
   "name": "specified-time-request",
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "packageManager": "pnpm@10.20.0",
   "description": "_description_",
   "author": "l123wx <llwxi@qq.com>",
