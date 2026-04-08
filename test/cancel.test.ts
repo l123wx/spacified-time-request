@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import request, { CancellationError, doOnTargetTime } from '../src/request'
+import { CancellationError } from '../src/connection'
+import request, { doOnTargetTime } from '../src/request'
 
 describe('取消控制测试', () => {
   it('cancel - 取消延迟请求', async () => {
