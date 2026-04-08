@@ -4,7 +4,17 @@
       "Bash(pnpm typecheck:*)",
       "Bash(pnpm start:*)",
       "Bash(curl:*)",
-      "Bash(pnpm add:*)"
+      "Bash(pnpm add:*)",
+      "Bash(npx vitest:*)",
+      "Bash(pnpm test:*)",
+      "Bash(node:*)",
+      "mcp__auggie-mcp__codebase-retrieval",
+      "Bash(pnpm build:*)",
+      "Bash(pnpm lint:*)",
+      "Bash(npx eslint:*)",
+      "Bash(git status:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ],
     "deny": [],
     "ask": []
