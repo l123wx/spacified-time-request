@@ -250,6 +250,55 @@ console.log(`请求等待 ${result.preparedMs}ms`)
 // 根据结果决定提前多久建连，确保不超过 preparedMs
 ```
 
+### `testMinDataRate(options, maxWaitMs?, precisionMs?, rateOptions?)`
+
+测试服务器对请求体数据速率的最小要求。使用二分查找找出 `prepare()` 到 `fire()` 之间最大可等待时长。
+
+某些服务器（如 ASP.NET Core/Kestrel）有 `MinRequestBodyDataRate` 限制，如果请求体数据传输太慢会拒绝请求。此函数通过检查响应状态码判断请求是否成功。
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `options` | `RequestOptions` | ✅ | - | 请求配置（**必须有 body**） |
+| `maxWaitMs` | `number` | ❌ | `5000` | 最大测试等待时间（毫秒） |
+| `precisionMs` | `number` | ❌ | `50` | 测试精度（毫秒） |
+| `rateOptions` | `MinDataRateOptions` | ❌ | `{}` | 额外的测试选项 |
+
+##### `MinDataRateOptions`
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `successStatusCodes` | `number[]` | ❌ | `[]` | 认为成功的状态码列表，空数组时默认 2xx |
+| `testTimeoutMs` | `number` | ❌ | `5000` | 单次测试的响应超时时间（毫秒） |
+
+返回 `Promise<MinDataRateResult>`：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `maxWaitMs` | `number` | 最大可等待时长（毫秒），超过此值服务器会拒绝请求 |
+| `precisionMs` | `number` | 使用的测试精度 |
+| `iterations` | `number` | 测试次数 |
+| `statusCode` | `number` | 最后一次成功测试时的响应状态码 |
+
+#### 示例
+
+```ts
+import { testMinDataRate } from '@l123wx/specified-time-request'
+
+const result = await testMinDataRate({
+  host: 'api.example.com',
+  port: 443,
+  https: true,
+  method: 'POST',
+  path: '/api/checkout',
+  body: JSON.stringify({ item: 'test' }),
+  headers: { Authorization: 'Bearer token' },
+})
+
+console.log(`最大可等待 ${result.maxWaitMs}ms，超过会超时`)
+console.log(`测试精度: ±${result.precisionMs}ms，测试 ${result.iterations} 次`)
+console.log(`最后成功响应状态码: ${result.statusCode}`)
+```
+
 ### `doOnTargetTime(callback, targetTime)`
 
 在精确的目标时间执行回调。使用 `setTimeout` 提前唤醒 + 忙等待实现毫秒级精度。
@@ -268,6 +317,8 @@ import type {
   CancellationError,
   Connection,
   ConnectOptions,
+  MinDataRateOptions,
+  MinDataRateResult,
   RequestInit,
   RequestOptions,
   TimeoutResult,
